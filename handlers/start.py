@@ -1,11 +1,57 @@
-from aiogram import Router, F
+from aiogram import Router
 from aiogram.filters import CommandStart
 from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove
 
+from config import is_admin
 from keyboards.main_menu_inline import get_main_menu_inline
-from services.google_sheets import append_test_operation
+from services.google_sheets import (
+    append_test_operation,
+    build_user_recent_operations_text,
+)
 
 router = Router()
+
+
+def build_main_menu_text(user_id: int | None = None) -> str:
+    text = "Главное меню:"
+
+    if user_id:
+        text += f"\n\nТвой Telegram ID: {user_id}"
+
+    return text
+
+
+def get_user_is_admin(user_id: int | None) -> bool:
+    return is_admin(user_id)
+
+
+async def show_main_menu_for_message(message: Message, show_user_id: bool = False) -> None:
+    user = message.from_user
+    user_id = user.id if user else None
+
+    await message.answer(
+        text=build_main_menu_text(user_id if show_user_id else None),
+        reply_markup=get_main_menu_inline(is_admin=get_user_is_admin(user_id)),
+    )
+
+
+async def show_main_menu_for_callback(
+    callback: CallbackQuery,
+    text: str = "Главное меню:",
+) -> None:
+    user = callback.from_user
+    user_id = user.id if user else None
+
+    try:
+        await callback.message.edit_text(
+            text=text,
+            reply_markup=get_main_menu_inline(is_admin=get_user_is_admin(user_id)),
+        )
+    except Exception:
+        await callback.message.answer(
+            text=text,
+            reply_markup=get_main_menu_inline(is_admin=get_user_is_admin(user_id)),
+        )
 
 
 @router.message(CommandStart())
@@ -19,26 +65,44 @@ async def cmd_start(message: Message) -> None:
             "Пока я запущен в тестовом режиме.\n\n"
             "Выбери действие:"
         ),
-        reply_markup=ReplyKeyboardRemove()
+        reply_markup=ReplyKeyboardRemove(),
     )
 
-    await message.answer(
-        text="Главное меню:",
-        reply_markup=get_main_menu_inline()
-    )
+    await show_main_menu_for_message(message, show_user_id=True)
 
 
-@router.callback_query(F.data == "main:last_operations")
+@router.callback_query(lambda callback: callback.data == "main:last_operations")
 async def handle_last_operations(callback: CallbackQuery) -> None:
     await callback.answer()
 
-    await callback.message.answer(
-        "Просмотр последних записей подключим позже.",
-        reply_markup=get_main_menu_inline()
-    )
+    user = callback.from_user
+    user_id = user.id if user else None
+
+    if user_id is None:
+        await show_main_menu_for_callback(
+            callback,
+            "📄 Мои последние записи\n\n"
+            "Не удалось определить пользователя.",
+        )
+        return
+
+    try:
+        text = build_user_recent_operations_text(user_id=user_id, limit=5)
+
+        await show_main_menu_for_callback(
+            callback,
+            text,
+        )
+
+    except Exception as error:
+        await show_main_menu_for_callback(
+            callback,
+            "❌ Не получилось получить последние записи.\n\n"
+            f"Ошибка: {error}",
+        )
 
 
-@router.callback_query(F.data == "main:check_table")
+@router.callback_query(lambda callback: callback.data == "main:check_table")
 async def handle_check_table(callback: CallbackQuery) -> None:
     await callback.answer()
 
@@ -52,38 +116,31 @@ async def handle_check_table(callback: CallbackQuery) -> None:
         )
 
         if result.get("ok"):
-            await callback.message.answer(
-                "✅ Тестовая запись добавлена в таблицу.",
-                reply_markup=get_main_menu_inline()
-            )
+            text = "✅ Тестовая запись добавлена в таблицу."
         else:
-            await callback.message.answer(
+            text = (
                 "❌ Скрипт ответил ошибкой.\n\n"
-                f"{result}",
-                reply_markup=get_main_menu_inline()
+                f"{result}"
             )
 
-    except Exception as error:
-        await callback.message.answer(
-            "❌ Не получилось добавить тестовую запись.\n\n"
-            f"Ошибка: {error}",
-            reply_markup=get_main_menu_inline()
+        await show_main_menu_for_callback(
+            callback,
+            text,
         )
 
-
-@router.callback_query(F.data == "main:admin")
-async def handle_admin_menu(callback: CallbackQuery) -> None:
-    await callback.answer()
-
-    await callback.message.answer(
-        "Админ-меню подключим после базовой записи операций.",
-        reply_markup=get_main_menu_inline()
-    )
+    except Exception as error:
+        await show_main_menu_for_callback(
+            callback,
+            "❌ Не получилось добавить тестовую запись.\n\n"
+            f"Ошибка: {error}",
+        )
 
 
 @router.message()
 async def handle_unknown_message(message: Message) -> None:
     await message.answer(
         "Пока не понял команду. Выбери действие через меню:",
-        reply_markup=get_main_menu_inline()
+        reply_markup=get_main_menu_inline(
+            is_admin=get_user_is_admin(message.from_user.id if message.from_user else None)
+        ),
     )

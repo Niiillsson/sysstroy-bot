@@ -1,10 +1,11 @@
 from datetime import datetime
 from uuid import uuid4
 
-from aiogram import Router, F
+from aiogram import Router, F, Bot
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup
 
 from services.google_sheets import append_operation
 from keyboards.main_menu_inline import get_main_menu_inline
@@ -93,6 +94,20 @@ GROUPS = {
 }
 
 
+PAYERS = {
+    "expense": [
+        ("-", "minus"),
+        ("Антон", "anton"),
+        ("Ввести вручную", "manual"),
+    ],
+    "income": [
+        ("Гость / Клиент", "guest_client"),
+        ("Заказчик", "customer"),
+        ("Ввести вручную", "manual"),
+    ],
+}
+
+
 def find_by_id(items: list[dict], item_id: str) -> dict | None:
     for item in items:
         if item["id"] == item_id:
@@ -100,18 +115,141 @@ def find_by_id(items: list[dict], item_id: str) -> dict | None:
     return None
 
 
-def get_operation_type_name(operation_type: str) -> str:
+def get_operation_type_name(operation_type: str | None) -> str:
     if operation_type == "income":
         return "Доход"
     if operation_type == "expense":
         return "Расход"
-    return operation_type
+    return "Не выбран"
 
 
-async def show_operation_type(message_or_callback: Message | CallbackQuery, state: FSMContext) -> None:
+def get_payer_label(operation_type: str | None) -> str:
+    if operation_type == "income":
+        return "Источник дохода"
+    return "Кто платил"
+
+
+def get_cash_label(value: str | None) -> str:
+    return value if value else "Не указано"
+
+
+def format_amount(amount: int | None) -> str:
+    if amount is None:
+        return "Не указана"
+    return f"{amount:,}".replace(",", " ") + " ₽"
+
+
+def parse_amount(raw_text: str | None) -> int | None:
+    if not raw_text:
+        return None
+
+    cleaned = (
+        raw_text.strip()
+        .replace(" ", "")
+        .replace("₽", "")
+        .replace("р", "")
+        .replace("Р", "")
+        .replace(".", "")
+    )
+
+    if not cleaned.isdigit():
+        return None
+
+    amount = int(cleaned)
+
+    if amount <= 0:
+        return None
+
+    return amount
+
+
+def get_operation_summary(data: dict) -> str:
+    operation_type = data.get("operation_type")
+    payer_label = get_payer_label(operation_type)
+
+    return (
+        "🧾 Добавление операции\n\n"
+        f"Тип: {get_operation_type_name(operation_type)}\n"
+        f"Дата: {data.get('operation_date', 'Не указана')}\n"
+        f"Локация: {data.get('location_name', 'Не выбрана')}\n"
+        f"{payer_label}: {data.get('payer', 'Не указан')}\n"
+        f"Сумма: {format_amount(data.get('amount'))}\n"
+        f"Наличка: {get_cash_label(data.get('is_cash'))}\n"
+        f"Категория: {data.get('category_name', 'Не выбрана')}\n"
+        f"Группа: {data.get('group_name', 'Не выбрана')}\n"
+        f"Комментарий: {data.get('comment') or 'Не указан'}"
+    )
+
+
+async def safe_delete_user_message(message: Message) -> None:
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        pass
+
+
+async def update_operation_message(
+    source: Message | CallbackQuery,
+    state: FSMContext,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    data = await state.get_data()
+
+    if isinstance(source, CallbackQuery):
+        bot: Bot = source.bot
+        chat_id = source.message.chat.id
+        current_message_id = source.message.message_id
+    else:
+        bot: Bot = source.bot
+        chat_id = source.chat.id
+        current_message_id = data.get("main_message_id")
+
+    main_message_id = data.get("main_message_id") or current_message_id
+
+    if main_message_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=main_message_id,
+                text=text,
+                reply_markup=reply_markup,
+            )
+            await state.update_data(main_message_id=main_message_id)
+            return
+        except TelegramBadRequest as error:
+            error_text = str(error)
+
+            if "message is not modified" in error_text:
+                return
+
+            sent_message = await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_markup,
+            )
+            await state.update_data(main_message_id=sent_message.message_id)
+            return
+
+    sent_message = await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=reply_markup,
+    )
+    await state.update_data(main_message_id=sent_message.message_id)
+
+
+async def show_operation_type(
+    message_or_callback: Message | CallbackQuery,
+    state: FSMContext,
+) -> None:
     await state.set_state(OperationStates.operation_type)
 
-    text = "Выбери тип операции:"
+    text = (
+        "🧾 Добавление операции\n\n"
+        "Выбери тип операции:"
+    )
+
     keyboard = build_inline_keyboard(
         [
             ("Доход", "op_type:income"),
@@ -121,81 +259,182 @@ async def show_operation_type(message_or_callback: Message | CallbackQuery, stat
         add_cancel=True,
     )
 
-    if isinstance(message_or_callback, CallbackQuery):
-        await message_or_callback.message.answer(text, reply_markup=keyboard)
-    else:
-        await message_or_callback.answer(text, reply_markup=keyboard)
+    await update_operation_message(message_or_callback, state, text, keyboard)
 
 
-async def show_operation_date(callback: CallbackQuery, state: FSMContext) -> None:
+async def show_operation_date(
+    message_or_callback: Message | CallbackQuery,
+    state: FSMContext,
+    error_text: str | None = None,
+) -> None:
     await state.set_state(OperationStates.operation_date)
 
-    await callback.message.answer(
-        "Укажи дату операции.\n\n"
-        "Можно написать дату в формате ДД.ММ.ГГГГ или нажать “Сегодня”.",
-        reply_markup=build_inline_keyboard(
-            [("Сегодня", "op_date:today")],
-            add_back=True,
-            add_cancel=True,
-        )
+    data = await state.get_data()
+
+    text = (
+        f"{get_operation_summary(data)}\n\n"
+        "📅 Укажи дату операции.\n\n"
+        "Можно написать дату в формате ДД.ММ.ГГГГ или нажать “Сегодня”."
     )
 
+    if error_text:
+        text += f"\n\n⚠️ {error_text}"
 
-async def show_location(callback: CallbackQuery, state: FSMContext) -> None:
+    keyboard = build_inline_keyboard(
+        [("Сегодня", "op_date:today")],
+        add_back=True,
+        add_cancel=True,
+    )
+
+    await update_operation_message(message_or_callback, state, text, keyboard)
+
+
+async def show_location(
+    message_or_callback: Message | CallbackQuery,
+    state: FSMContext,
+) -> None:
     await state.set_state(OperationStates.location)
+
+    data = await state.get_data()
 
     buttons = [
         (location["name"], f"op_location:{location['id']}")
         for location in LOCATIONS
     ]
 
-    await callback.message.answer(
-        "Выбери локацию:",
-        reply_markup=build_inline_keyboard(buttons)
+    text = (
+        f"{get_operation_summary(data)}\n\n"
+        "📍 Выбери локацию:"
+    )
+
+    await update_operation_message(
+        message_or_callback,
+        state,
+        text,
+        build_inline_keyboard(buttons),
     )
 
 
-async def show_payer(callback: CallbackQuery, state: FSMContext) -> None:
+async def show_payer(
+    message_or_callback: Message | CallbackQuery,
+    state: FSMContext,
+) -> None:
+    data = await state.get_data()
+    operation_type = data["operation_type"]
+
     await state.set_state(OperationStates.payer)
 
-    await callback.message.answer(
-        "Кто платил?",
-        reply_markup=build_inline_keyboard(
-            [
-                ("-", "op_payer:minus"),
-                ("Антон", "op_payer:anton"),
-                ("Ввести вручную", "op_payer:manual"),
-            ]
-        )
+    if operation_type == "income":
+        question = "💰 От кого поступили деньги?"
+    else:
+        question = "👤 Кто платил?"
+
+    buttons = [
+        (label, f"op_payer:{value}")
+        for label, value in PAYERS[operation_type]
+    ]
+
+    text = (
+        f"{get_operation_summary(data)}\n\n"
+        f"{question}"
+    )
+
+    await update_operation_message(
+        message_or_callback,
+        state,
+        text,
+        build_inline_keyboard(buttons),
     )
 
 
-async def show_amount(message_or_callback: Message | CallbackQuery, state: FSMContext) -> None:
+async def show_payer_manual(
+    callback: CallbackQuery,
+    state: FSMContext,
+    error_text: str | None = None,
+) -> None:
+    data = await state.get_data()
+    operation_type = data["operation_type"]
+
+    await state.set_state(OperationStates.payer_manual)
+
+    if operation_type == "income":
+        question = "Напиши, от кого поступили деньги, текстом."
+    else:
+        question = "Напиши, кто платил, текстом."
+
+    text = (
+        f"{get_operation_summary(data)}\n\n"
+        f"✍️ {question}"
+    )
+
+    if error_text:
+        text += f"\n\n⚠️ {error_text}"
+
+    keyboard = build_inline_keyboard(
+        [],
+        add_back=True,
+        add_cancel=True,
+    )
+
+    await update_operation_message(callback, state, text, keyboard)
+
+
+async def show_amount(
+    message_or_callback: Message | CallbackQuery,
+    state: FSMContext,
+    error_text: str | None = None,
+) -> None:
     await state.set_state(OperationStates.amount)
 
-    text = "Укажи сумму. Только число, без пробелов и символов."
+    data = await state.get_data()
 
-    if isinstance(message_or_callback, CallbackQuery):
-        await message_or_callback.message.answer(text)
-    else:
-        await message_or_callback.answer(text)
-
-
-async def show_is_cash(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(OperationStates.is_cash)
-
-    await callback.message.answer(
-        "Это наличка?",
-        reply_markup=build_inline_keyboard(
-            [
-                ("Да", "op_cash:yes"),
-                ("Нет", "op_cash:no"),
-            ]
-        )
+    text = (
+        f"{get_operation_summary(data)}\n\n"
+        "💵 Укажи сумму сообщением.\n\n"
+        "Например: 3500 или 3 500"
     )
 
+    if error_text:
+        text += f"\n\n⚠️ {error_text}"
 
-async def show_category(callback: CallbackQuery, state: FSMContext) -> None:
+    keyboard = build_inline_keyboard(
+        [],
+        add_back=True,
+        add_cancel=True,
+    )
+
+    await update_operation_message(message_or_callback, state, text, keyboard)
+
+
+async def show_is_cash(
+    message_or_callback: Message | CallbackQuery,
+    state: FSMContext,
+) -> None:
+    await state.set_state(OperationStates.is_cash)
+
+    data = await state.get_data()
+
+    text = (
+        f"{get_operation_summary(data)}\n\n"
+        "💸 Это наличка?"
+    )
+
+    keyboard = build_inline_keyboard(
+        [
+            ("Да", "op_cash:yes"),
+            ("Нет", "op_cash:no"),
+        ],
+        add_back=True,
+        add_cancel=True,
+    )
+
+    await update_operation_message(message_or_callback, state, text, keyboard)
+
+
+async def show_category(
+    message_or_callback: Message | CallbackQuery,
+    state: FSMContext,
+) -> None:
     data = await state.get_data()
     operation_type = data["operation_type"]
 
@@ -207,13 +446,23 @@ async def show_category(callback: CallbackQuery, state: FSMContext) -> None:
         for category in categories
     ]
 
-    await callback.message.answer(
-        "Выбери категорию:",
-        reply_markup=build_inline_keyboard(buttons)
+    text = (
+        f"{get_operation_summary(data)}\n\n"
+        "🏷️ Выбери категорию:"
+    )
+
+    await update_operation_message(
+        message_or_callback,
+        state,
+        text,
+        build_inline_keyboard(buttons),
     )
 
 
-async def show_group(callback: CallbackQuery, state: FSMContext) -> None:
+async def show_group(
+    message_or_callback: Message | CallbackQuery,
+    state: FSMContext,
+) -> None:
     data = await state.get_data()
     category_id = data["category_id"]
 
@@ -222,7 +471,16 @@ async def show_group(callback: CallbackQuery, state: FSMContext) -> None:
     groups = GROUPS.get(category_id, [])
 
     if not groups:
-        await callback.message.answer("Для этой категории пока нет групп.")
+        text = (
+            f"{get_operation_summary(data)}\n\n"
+            "⚠️ Для этой категории пока нет групп."
+        )
+        await update_operation_message(
+            message_or_callback,
+            state,
+            text,
+            build_inline_keyboard([], add_back=True, add_cancel=True),
+        )
         return
 
     buttons = [
@@ -230,43 +488,53 @@ async def show_group(callback: CallbackQuery, state: FSMContext) -> None:
         for group in groups
     ]
 
-    await callback.message.answer(
-        "Выбери группу:",
-        reply_markup=build_inline_keyboard(buttons)
+    text = (
+        f"{get_operation_summary(data)}\n\n"
+        "📂 Выбери группу:"
+    )
+
+    await update_operation_message(
+        message_or_callback,
+        state,
+        text,
+        build_inline_keyboard(buttons),
     )
 
 
-async def show_comment(message_or_callback: Message | CallbackQuery, state: FSMContext) -> None:
+async def show_comment(
+    message_or_callback: Message | CallbackQuery,
+    state: FSMContext,
+) -> None:
     await state.set_state(OperationStates.comment)
 
-    text = "Добавь комментарий: что это за доход/расход?"
-    keyboard = build_inline_keyboard(
-        [("Без комментария", "op_comment:empty")]
-    )
-
-    if isinstance(message_or_callback, CallbackQuery):
-        await message_or_callback.message.answer(text, reply_markup=keyboard)
-    else:
-        await message_or_callback.answer(text, reply_markup=keyboard)
-
-
-async def show_confirmation(message_or_callback: Message | CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
 
-    confirmation_text = (
-        "Проверь запись перед сохранением:\n\n"
-        f"Тип: {get_operation_type_name(data['operation_type'])}\n"
-        f"Дата: {data['operation_date']}\n"
-        f"Локация: {data['location_name']}\n"
-        f"Кто платил: {data['payer']}\n"
-        f"Сумма: {data['amount']}\n"
-        f"Наличка: {data['is_cash']}\n"
-        f"Категория: {data['category_name']}\n"
-        f"Группа: {data['group_name']}\n"
-        f"Комментарий: {data['comment'] or '-'}"
+    text = (
+        f"{get_operation_summary(data)}\n\n"
+        "💬 Добавь комментарий: что это за доход/расход?"
     )
 
+    keyboard = build_inline_keyboard(
+        [("Без комментария", "op_comment:empty")],
+        add_back=True,
+        add_cancel=True,
+    )
+
+    await update_operation_message(message_or_callback, state, text, keyboard)
+
+
+async def show_confirmation(
+    message_or_callback: Message | CallbackQuery,
+    state: FSMContext,
+) -> None:
+    data = await state.get_data()
+
     await state.set_state(OperationStates.confirm)
+
+    text = (
+        "✅ Проверь запись перед сохранением:\n\n"
+        f"{get_operation_summary(data)}"
+    )
 
     keyboard = build_inline_keyboard(
         [("✅ Подтвердить", "op_confirm")],
@@ -274,10 +542,7 @@ async def show_confirmation(message_or_callback: Message | CallbackQuery, state:
         add_cancel=True,
     )
 
-    if isinstance(message_or_callback, CallbackQuery):
-        await message_or_callback.message.answer(confirmation_text, reply_markup=keyboard)
-    else:
-        await message_or_callback.answer(confirmation_text, reply_markup=keyboard)
+    await update_operation_message(message_or_callback, state, text, keyboard)
 
 
 @router.message(F.text == "➕ Добавить операцию")
@@ -290,6 +555,7 @@ async def start_operation_from_reply_button(message: Message, state: FSMContext)
 async def start_operation_from_inline_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.clear()
+    await state.update_data(main_message_id=callback.message.message_id)
     await show_operation_type(callback, state)
 
 
@@ -298,9 +564,11 @@ async def cancel_operation(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.clear()
 
-    await callback.message.answer(
+    await update_operation_message(
+        callback,
+        state,
         "Операция отменена. Возвращаю в главное меню.",
-        reply_markup=get_main_menu_inline()
+        get_main_menu_inline(),
     )
 
 
@@ -310,7 +578,21 @@ async def process_operation_type(callback: CallbackQuery, state: FSMContext) -> 
 
     operation_type = callback.data.split(":")[1]
 
-    await state.update_data(operation_type=operation_type)
+    await state.update_data(
+        operation_type=operation_type,
+        operation_date=None,
+        location_id=None,
+        location_name=None,
+        payer=None,
+        amount=None,
+        is_cash=None,
+        category_id=None,
+        category_name=None,
+        group_id=None,
+        group_name=None,
+        comment=None,
+    )
+
     await show_operation_date(callback, state)
 
 
@@ -332,24 +614,22 @@ async def process_today_date(callback: CallbackQuery, state: FSMContext) -> None
 
 @router.message(OperationStates.operation_date)
 async def process_manual_date(message: Message, state: FSMContext) -> None:
+    raw_date = message.text
+
+    await safe_delete_user_message(message)
+
     try:
-        operation_date = datetime.strptime(message.text, "%d.%m.%Y").strftime("%Y-%m-%d")
-    except ValueError:
-        await message.answer("Дата должна быть в формате ДД.ММ.ГГГГ. Например: 25.05.2026")
+        operation_date = datetime.strptime(raw_date, "%d.%m.%Y").strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        await show_operation_date(
+            message,
+            state,
+            "Дата должна быть в формате ДД.ММ.ГГГГ. Например: 25.05.2026",
+        )
         return
 
     await state.update_data(operation_date=operation_date)
-    await state.set_state(OperationStates.location)
-
-    buttons = [
-        (location["name"], f"op_location:{location['id']}")
-        for location in LOCATIONS
-    ]
-
-    await message.answer(
-        "Выбери локацию:",
-        reply_markup=build_inline_keyboard(buttons)
-    )
+    await show_location(message, state)
 
 
 @router.callback_query(OperationStates.location, F.data == "op_back")
@@ -366,12 +646,25 @@ async def process_location(callback: CallbackQuery, state: FSMContext) -> None:
     location = find_by_id(LOCATIONS, location_id)
 
     if not location:
-        await callback.message.answer("Локация не найдена.")
+        await update_operation_message(
+            callback,
+            state,
+            "⚠️ Локация не найдена. Попробуй выбрать ещё раз.",
+            build_inline_keyboard([], add_back=True, add_cancel=True),
+        )
         return
 
     await state.update_data(
         location_id=location["id"],
-        location_name=location["name"]
+        location_name=location["name"],
+        payer=None,
+        amount=None,
+        is_cash=None,
+        category_id=None,
+        category_name=None,
+        group_id=None,
+        group_name=None,
+        comment=None,
     )
 
     await show_payer(callback, state)
@@ -390,13 +683,38 @@ async def process_payer(callback: CallbackQuery, state: FSMContext) -> None:
     payer_value = callback.data.split(":")[1]
 
     if payer_value == "manual":
-        await state.set_state(OperationStates.payer_manual)
-        await callback.message.answer("Напиши, кто платил, текстом.")
+        await show_payer_manual(callback, state)
         return
 
-    payer = "-" if payer_value == "minus" else "Антон"
+    payer_map = {
+        "minus": "-",
+        "anton": "Антон",
+        "guest_client": "Гость / Клиент",
+        "customer": "Заказчик",
+    }
 
-    await state.update_data(payer=payer)
+    payer = payer_map.get(payer_value)
+
+    if not payer:
+        await update_operation_message(
+            callback,
+            state,
+            "⚠️ Не удалось определить значение. Попробуй выбрать ещё раз.",
+            build_inline_keyboard([], add_back=True, add_cancel=True),
+        )
+        return
+
+    await state.update_data(
+        payer=payer,
+        amount=None,
+        is_cash=None,
+        category_id=None,
+        category_name=None,
+        group_id=None,
+        group_name=None,
+        comment=None,
+    )
+
     await show_amount(callback, state)
 
 
@@ -408,40 +726,63 @@ async def back_from_payer_manual(callback: CallbackQuery, state: FSMContext) -> 
 
 @router.message(OperationStates.payer_manual)
 async def process_payer_manual(message: Message, state: FSMContext) -> None:
-    payer = message.text.strip()
+    payer = message.text.strip() if message.text else ""
+
+    await safe_delete_user_message(message)
 
     if not payer:
-        await message.answer("Напиши, кто платил, текстом.")
+        await show_payer_manual(
+            message,
+            state,
+            "Значение не должно быть пустым.",
+        )
         return
 
-    await state.update_data(payer=payer)
+    await state.update_data(
+        payer=payer,
+        amount=None,
+        is_cash=None,
+        category_id=None,
+        category_name=None,
+        group_id=None,
+        group_name=None,
+        comment=None,
+    )
+
     await show_amount(message, state)
+
+
+@router.callback_query(OperationStates.amount, F.data == "op_back")
+async def back_from_amount(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await show_payer(callback, state)
 
 
 @router.message(OperationStates.amount)
 async def process_amount(message: Message, state: FSMContext) -> None:
-    try:
-        amount = int(message.text)
-    except ValueError:
-        await message.answer("Сумма должна быть целым числом. Например: 3500")
-        return
+    amount = parse_amount(message.text)
 
-    if amount <= 0:
-        await message.answer("Сумма должна быть больше нуля.")
-        return
+    await safe_delete_user_message(message)
 
-    await state.update_data(amount=amount)
-    await state.set_state(OperationStates.is_cash)
-
-    await message.answer(
-        "Это наличка?",
-        reply_markup=build_inline_keyboard(
-            [
-                ("Да", "op_cash:yes"),
-                ("Нет", "op_cash:no"),
-            ]
+    if amount is None:
+        await show_amount(
+            message,
+            state,
+            "Сумма должна быть положительным целым числом. Например: 3500 или 3 500",
         )
+        return
+
+    await state.update_data(
+        amount=amount,
+        is_cash=None,
+        category_id=None,
+        category_name=None,
+        group_id=None,
+        group_name=None,
+        comment=None,
     )
+
+    await show_is_cash(message, state)
 
 
 @router.callback_query(OperationStates.is_cash, F.data == "op_back")
@@ -457,7 +798,15 @@ async def process_is_cash(callback: CallbackQuery, state: FSMContext) -> None:
     cash_value = callback.data.split(":")[1]
     is_cash = "Да" if cash_value == "yes" else "Нет"
 
-    await state.update_data(is_cash=is_cash)
+    await state.update_data(
+        is_cash=is_cash,
+        category_id=None,
+        category_name=None,
+        group_id=None,
+        group_name=None,
+        comment=None,
+    )
+
     await show_category(callback, state)
 
 
@@ -480,12 +829,20 @@ async def process_category(callback: CallbackQuery, state: FSMContext) -> None:
     category = find_by_id(categories, category_id)
 
     if not category:
-        await callback.message.answer("Категория не найдена.")
+        await update_operation_message(
+            callback,
+            state,
+            "⚠️ Категория не найдена. Попробуй выбрать ещё раз.",
+            build_inline_keyboard([], add_back=True, add_cancel=True),
+        )
         return
 
     await state.update_data(
         category_id=category["id"],
-        category_name=category["name"]
+        category_name=category["name"],
+        group_id=None,
+        group_name=None,
+        comment=None,
     )
 
     await show_group(callback, state)
@@ -510,12 +867,18 @@ async def process_group(callback: CallbackQuery, state: FSMContext) -> None:
     group = find_by_id(groups, group_id)
 
     if not group:
-        await callback.message.answer("Группа не найдена.")
+        await update_operation_message(
+            callback,
+            state,
+            "⚠️ Группа не найдена. Попробуй выбрать ещё раз.",
+            build_inline_keyboard([], add_back=True, add_cancel=True),
+        )
         return
 
     await state.update_data(
         group_id=group["id"],
-        group_name=group["name"]
+        group_name=group["name"],
+        comment=None,
     )
 
     await show_comment(callback, state)
@@ -537,7 +900,9 @@ async def process_empty_comment(callback: CallbackQuery, state: FSMContext) -> N
 
 @router.message(OperationStates.comment)
 async def process_comment(message: Message, state: FSMContext) -> None:
-    comment = "" if message.text == "Без комментария" else message.text
+    comment = message.text.strip() if message.text else ""
+
+    await safe_delete_user_message(message)
 
     await state.update_data(comment=comment)
     await show_confirmation(message, state)
@@ -583,23 +948,30 @@ async def process_confirm(callback: CallbackQuery, state: FSMContext) -> None:
         result = append_operation(payload)
 
         if result.get("ok"):
-            await callback.message.answer(
-                "✅ Запись добавлена в таблицу.",
-                reply_markup=get_main_menu_inline()
+            await update_operation_message(
+                callback,
+                state,
+                "✅ Запись добавлена в таблицу.\n\n"
+                "Можно добавить новую операцию или вернуться в меню.",
+                get_main_menu_inline(),
             )
             await state.clear()
         else:
-            await callback.message.answer(
+            await update_operation_message(
+                callback,
+                state,
                 "❌ Скрипт ответил ошибкой.\n\n"
                 f"{result}",
-                reply_markup=get_main_menu_inline()
+                get_main_menu_inline(),
             )
             await state.clear()
 
     except Exception as error:
-        await callback.message.answer(
+        await update_operation_message(
+            callback,
+            state,
             "❌ Не получилось сохранить запись.\n\n"
             f"Ошибка: {error}",
-            reply_markup=get_main_menu_inline()
+            get_main_menu_inline(),
         )
         await state.clear()
